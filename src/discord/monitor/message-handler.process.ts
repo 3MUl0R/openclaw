@@ -292,6 +292,8 @@ export async function processDiscordMessage(ctx: DiscordMessagePreflightContext)
     ThreadLabel: threadLabel,
     Timestamp: resolveTimestampMs(message.timestamp),
     ...mediaPayload,
+    // Thread ID for session persistence (matches Slack behavior).
+    MessageThreadId: threadChannel ? message.channelId : undefined,
     CommandAuthorized: commandAuthorized,
     CommandSource: "text" as const,
     // Originating channel for reply routing.
