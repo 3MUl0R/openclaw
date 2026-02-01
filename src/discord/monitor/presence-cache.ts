@@ -14,13 +14,19 @@ const TTL_MS = 60 * 60 * 1000;
 /** Maximum entries per account to prevent memory exhaustion. */
 const MAX_ENTRIES_PER_ACCOUNT = 10_000;
 
+/** Prune frequency - only prune every N sets to amortize cost. */
+const PRUNE_INTERVAL = 100;
+
 type PresenceEntry = {
   data: GatewayPresenceUpdate;
-  timestamp: number;
+  /** Timestamp when the presence was last updated (not accessed). */
+  updatedAt: number;
 };
 
 type AccountCache = {
   entries: Map<string, PresenceEntry>;
+  /** Counter for amortized pruning. */
+  setCount: number;
 };
 
 const presenceCache = new Map<string, AccountCache>();
@@ -32,7 +38,7 @@ function resolveAccountKey(accountId?: string): string {
 function getOrCreateAccountCache(accountKey: string): AccountCache {
   let accountCache = presenceCache.get(accountKey);
   if (!accountCache) {
-    accountCache = { entries: new Map() };
+    accountCache = { entries: new Map(), setCount: 0 };
     presenceCache.set(accountKey, accountCache);
   }
   return accountCache;
@@ -40,12 +46,12 @@ function getOrCreateAccountCache(accountKey: string): AccountCache {
 
 /**
  * Remove expired entries from the cache.
- * Called periodically during set/get operations.
+ * O(n) but only called periodically via amortized pruning.
  */
 function pruneExpired(cache: AccountCache, now: number): void {
   const cutoff = now - TTL_MS;
   for (const [userId, entry] of cache.entries) {
-    if (entry.timestamp < cutoff) {
+    if (entry.updatedAt < cutoff) {
       cache.entries.delete(userId);
     }
   }
@@ -53,21 +59,14 @@ function pruneExpired(cache: AccountCache, now: number): void {
 
 /**
  * Evict oldest entries if cache exceeds max size.
- * Uses LRU-style eviction (oldest timestamp first).
+ * Uses Map insertion order for O(1) amortized LRU - oldest entries are first.
  */
 function enforceMaxSize(cache: AccountCache): void {
-  if (cache.entries.size <= MAX_ENTRIES_PER_ACCOUNT) {
-    return;
-  }
-
-  // Sort by timestamp and remove oldest entries
-  const sorted = [...cache.entries.entries()].sort(
-    (a, b) => a[1].timestamp - b[1].timestamp,
-  );
-
-  const toRemove = sorted.slice(0, cache.entries.size - MAX_ENTRIES_PER_ACCOUNT);
-  for (const [userId] of toRemove) {
-    cache.entries.delete(userId);
+  // Delete from the front (oldest) until within bounds
+  while (cache.entries.size > MAX_ENTRIES_PER_ACCOUNT) {
+    const oldestKey = cache.entries.keys().next().value;
+    if (oldestKey === undefined) break;
+    cache.entries.delete(oldestKey);
   }
 }
 
@@ -81,12 +80,14 @@ export function setPresence(
   const cache = getOrCreateAccountCache(accountKey);
   const now = Date.now();
 
-  // Update or insert entry
-  cache.entries.set(userId, { data, timestamp: now });
+  // Delete then set to move to end of Map (maintains LRU order)
+  cache.entries.delete(userId);
+  cache.entries.set(userId, { data, updatedAt: now });
 
-  // Periodic maintenance: prune expired and enforce max size
-  // Only run when cache is getting large to avoid overhead
-  if (cache.entries.size > MAX_ENTRIES_PER_ACCOUNT) {
+  // Amortized maintenance: prune and enforce max size periodically
+  cache.setCount++;
+  if (cache.setCount >= PRUNE_INTERVAL) {
+    cache.setCount = 0;
     pruneExpired(cache, now);
     enforceMaxSize(cache);
   }
@@ -107,15 +108,16 @@ export function getPresence(
     return undefined;
   }
 
-  // Check if expired
+  // Check if expired (strict TTL - not updated on read)
   const now = Date.now();
-  if (now - entry.timestamp > TTL_MS) {
+  if (now - entry.updatedAt > TTL_MS) {
     cache.entries.delete(userId);
     return undefined;
   }
 
-  // Update timestamp on access (LRU behavior)
-  entry.timestamp = now;
+  // Note: We intentionally do NOT update the timestamp on read.
+  // TTL is based on when the presence was last updated by Discord,
+  // not when it was last accessed.
   return entry.data;
 }
 
@@ -139,3 +141,78 @@ export function presenceCacheSize(accountId?: string): number {
   }
   return total;
 }
+
+/**
+ * Exported for testing: allows injecting a custom "now" timestamp.
+ * @internal
+ */
+export function setPresenceWithTime(
+  accountId: string | undefined,
+  userId: string,
+  data: GatewayPresenceUpdate,
+  now: number,
+): void {
+  const accountKey = resolveAccountKey(accountId);
+  const cache = getOrCreateAccountCache(accountKey);
+
+  cache.entries.delete(userId);
+  cache.entries.set(userId, { data, updatedAt: now });
+
+  cache.setCount++;
+  if (cache.setCount >= PRUNE_INTERVAL) {
+    cache.setCount = 0;
+    pruneExpired(cache, now);
+    enforceMaxSize(cache);
+  }
+}
+
+/**
+ * Exported for testing: get presence with custom "now" for TTL check.
+ * @internal
+ */
+export function getPresenceWithTime(
+  accountId: string | undefined,
+  userId: string,
+  now: number,
+): GatewayPresenceUpdate | undefined {
+  const cache = presenceCache.get(resolveAccountKey(accountId));
+  if (!cache) {
+    return undefined;
+  }
+
+  const entry = cache.entries.get(userId);
+  if (!entry) {
+    return undefined;
+  }
+
+  if (now - entry.updatedAt > TTL_MS) {
+    cache.entries.delete(userId);
+    return undefined;
+  }
+
+  return entry.data;
+}
+
+/**
+ * Exported for testing: force a prune cycle.
+ * @internal
+ */
+export function forcePrune(accountId?: string): void {
+  const now = Date.now();
+  if (accountId) {
+    const cache = presenceCache.get(resolveAccountKey(accountId));
+    if (cache) {
+      pruneExpired(cache, now);
+      enforceMaxSize(cache);
+    }
+  } else {
+    for (const cache of presenceCache.values()) {
+      pruneExpired(cache, now);
+      enforceMaxSize(cache);
+    }
+  }
+}
+
+/** Exported constants for testing. */
+export const PRESENCE_CACHE_TTL_MS = TTL_MS;
+export const PRESENCE_CACHE_MAX_PER_ACCOUNT = MAX_ENTRIES_PER_ACCOUNT;
