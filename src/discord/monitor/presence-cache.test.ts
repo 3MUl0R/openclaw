@@ -127,19 +127,46 @@ describe("presence-cache", () => {
     it("maintains LRU order - recently updated entries survive eviction", () => {
       const now = Date.now();
 
-      // Add entries
-      setPresenceWithTime("account-a", "user-old", { status: "online" } as GatewayPresenceUpdate, now);
-      setPresenceWithTime("account-a", "user-new", { status: "idle" } as GatewayPresenceUpdate, now + 1000);
+      // Fill cache to max with entries 0 through MAX-1
+      for (let i = 0; i < PRESENCE_CACHE_MAX_PER_ACCOUNT; i++) {
+        setPresenceWithTime(
+          "account-a",
+          `user-${i}`,
+          { status: "online" } as GatewayPresenceUpdate,
+          now + i,
+        );
+      }
 
-      // Update the old entry (moves it to end of Map)
-      setPresenceWithTime("account-a", "user-old", { status: "dnd" } as GatewayPresenceUpdate, now + 2000);
+      // "Touch" user-0 by updating it (moves it to end of Map order)
+      setPresenceWithTime(
+        "account-a",
+        "user-0",
+        { status: "dnd" } as GatewayPresenceUpdate,
+        now + PRESENCE_CACHE_MAX_PER_ACCOUNT,
+      );
 
-      // Now user-new is older in LRU order despite being added later originally
-      // If we were to evict, user-new would go first
+      // Add new entries to trigger eviction (need to hit prune interval)
+      for (let i = 0; i < 100; i++) {
+        setPresenceWithTime(
+          "account-a",
+          `new-user-${i}`,
+          { status: "idle" } as GatewayPresenceUpdate,
+          now + PRESENCE_CACHE_MAX_PER_ACCOUNT + 1 + i,
+        );
+      }
 
-      // Verify both exist
-      expect(getPresenceWithTime("account-a", "user-old", now + 2000)).toBeDefined();
-      expect(getPresenceWithTime("account-a", "user-new", now + 2000)).toBeDefined();
+      // Force prune to ensure eviction happens
+      forcePrune("account-a");
+
+      // user-0 should survive because it was recently updated (moved to end)
+      const checkTime = now + PRESENCE_CACHE_MAX_PER_ACCOUNT + 200;
+      expect(getPresenceWithTime("account-a", "user-0", checkTime)).toBeDefined();
+
+      // user-1 should be evicted (was first in Map order, never updated)
+      expect(getPresenceWithTime("account-a", "user-1", checkTime)).toBeUndefined();
+
+      // Newest entries should exist
+      expect(getPresenceWithTime("account-a", "new-user-99", checkTime)).toBeDefined();
     });
   });
 
